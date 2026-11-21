@@ -1,0 +1,16 @@
+services:
+  weatherd:
+    container_name: weatherd
+    image: ghcr.io/dasph/weatherd:latest
+    restart: unless-stopped
+    networks:
+      - homeassistant
+    environment:
+      LOCATION: "warszawa,cId,36917"
+      WEBHOOK_URL: "http://homeassistant/api/webhook/CHANGE-ME"
+      REFRESH_INTERVAL: "1h"
+      TZ: "Europe/Warsaw"
+
+networks:
+  homeassistant:
+    external: true
