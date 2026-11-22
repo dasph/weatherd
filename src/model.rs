@@ -84,7 +84,7 @@ pub struct HourlyForecast {
     pub cloud_coverage: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DailyForecast {
     /// Local midnight of the day.
     #[serde(serialize_with = "rfc3339")]
@@ -95,12 +95,15 @@ pub struct DailyForecast {
     /// Daily low.
     pub native_templow: f64,
     pub native_precipitation: Option<f64>,
-    /// Strongest hourly wind of the day, with its bearing.
     pub native_wind_speed: Option<f64>,
     pub native_wind_gust_speed: Option<f64>,
     pub wind_bearing: Option<f64>,
+    /// Not on the long-term page; only set when the day is derived from the
+    /// hourly forecast.
     pub humidity: Option<f64>,
     pub cloud_coverage: Option<f64>,
+    /// Only on the long-term page.
+    pub uv_index: Option<f64>,
 }
 
 fn rfc3339<S: Serializer>(dt: &DateTime<Tz>, serializer: S) -> Result<S::Ok, S::Error> {

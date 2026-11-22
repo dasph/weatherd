@@ -1,20 +1,21 @@
-//! Extracts weather data from a pogoda.interia.pl "prognoza szczegółowa"
-//! (hour-by-hour forecast) page.
+//! Extracts weather data from pogoda.interia.pl pages: the "prognoza
+//! szczegółowa" (hour-by-hour forecast) page and the "prognoza
+//! długoterminowa" (45-day forecast) page.
 
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, LocalResult, NaiveDate, NaiveTime, TimeZone};
+use chrono::{DateTime, Datelike, LocalResult, NaiveDate, NaiveTime, TimeZone};
 use chrono_tz::Tz;
 use scraper::{ElementRef, Html, Selector};
 
 use crate::condition::{Condition, compass_to_degrees};
-use crate::model::{AirQuality, Current, HourlyForecast, Location};
+use crate::model::{AirQuality, Current, DailyForecast, HourlyForecast, Location};
 
 /// Hourly rain (mm) from which a rainy hour is reported as `pouring`.
 const POURING_MM_PER_HOUR: f64 = 4.0;
 
-/// Everything the page itself provides.
+/// Everything the hour-by-hour page provides.
 #[derive(Debug)]
 pub struct Page {
     pub location: Location,
@@ -31,7 +32,7 @@ macro_rules! selector {
     }};
 }
 
-/// Parses the page. Times on the page are local to `tz`.
+/// Parses the hour-by-hour page. Times on the page are local to `tz`.
 ///
 /// Fails when the page lacks the current temperature or any hourly entries,
 /// which means it is an error page or its markup changed; individual missing
@@ -232,6 +233,137 @@ fn parse_entry(
     })
 }
 
+/// Parses the 45-day page into one entry per day.
+///
+/// The page gives dates as day and month only; `today` anchors the year.
+/// Fails when the page has no usable entries.
+pub fn parse_long_term(html: &str, tz: Tz, today: NaiveDate) -> Result<Vec<DailyForecast>> {
+    let doc = Html::parse_document(html);
+    let mut daily = Vec::new();
+    let mut previous = None;
+
+    for entry in doc
+        .root_element()
+        .select(selector!(".weather-forecast-longterm-list-entry"))
+    {
+        let Some(date) = first_text(entry, selector!(".date"))
+            .and_then(|text| resolve_date(&text, previous, today))
+        else {
+            continue;
+        };
+        if let Some(forecast) = parse_day(entry, date, tz) {
+            daily.push(forecast);
+            previous = Some(date);
+        }
+    }
+
+    if daily.is_empty() {
+        bail!("no daily forecast entries found on the page");
+    }
+    Ok(daily)
+}
+
+/// Completes a "22.11" (day.month) date with a year.
+///
+/// The first entry is the date closest to `today`; every later entry is the
+/// next such date after the previous one, which carries the list over New
+/// Year.
+fn resolve_date(text: &str, previous: Option<NaiveDate>, today: NaiveDate) -> Option<NaiveDate> {
+    let (day, month) = text.trim().trim_end_matches('.').split_once('.')?;
+    let (day, month): (u32, u32) = (day.parse().ok()?, month.parse().ok()?);
+    let in_year = |year| NaiveDate::from_ymd_opt(year, month, day);
+    match previous {
+        Some(previous) => (previous.year()..=previous.year() + 1)
+            .filter_map(in_year)
+            .find(|date| *date > previous),
+        None => (today.year() - 1..=today.year() + 1)
+            .filter_map(in_year)
+            .min_by_key(|date| (*date - today).num_days().abs()),
+    }
+}
+
+/// Returns `None` for entries without usable temperatures.
+fn parse_day(entry: ElementRef, date: NaiveDate, tz: Tz) -> Option<DailyForecast> {
+    let datetime = tz
+        .from_local_datetime(&date.and_time(NaiveTime::MIN))
+        .earliest()?;
+
+    let icon = entry
+        .select(selector!(
+            ".weather-forecast-longterm-list-entry-forecast-icon"
+        ))
+        .next();
+    let phrase = first_text(
+        entry,
+        selector!(".weather-forecast-longterm-list-entry-forecast-phrase"),
+    )
+    .or_else(|| {
+        icon.and_then(|i| i.value().attr("title"))
+            .map(str::to_owned)
+    });
+
+    // "Deszcz:" (rain, mm) and, on some days, "Śnieg:" (snow, cm).
+    let mut precipitation = None;
+    for item in entry.select(selector!(".precipitation-types .item")) {
+        let Some(value) = item
+            .select(selector!(
+                ".weather-forecast-longterm-list-entry-precipitation-value"
+            ))
+            .next()
+        else {
+            continue;
+        };
+        let Some(amount) = number(&text(value)) else {
+            continue;
+        };
+        let unit = first_text(value, selector!(".precipitation-unit")).unwrap_or_default();
+        let is_snow = first_text(
+            item,
+            selector!(".weather-forecast-longterm-list-entry-precipitation-type"),
+        )
+        .is_some_and(|label| label.to_lowercase().contains("śnieg"));
+        *precipitation.get_or_insert(0.0) += liquid_mm(amount, &unit, is_snow);
+    }
+
+    Some(DailyForecast {
+        datetime,
+        condition: Condition::resolve(icon.and_then(icon_code), phrase.as_deref()),
+        native_temperature: first_number(
+            entry,
+            selector!(".weather-forecast-longterm-list-entry-forecast-temp"),
+        )?,
+        native_templow: first_number(
+            entry,
+            selector!(".weather-forecast-longterm-list-entry-forecast-lowtemp"),
+        )?,
+        native_precipitation: precipitation.map(round1),
+        native_wind_speed: first_number(
+            entry,
+            selector!(".weather-forecast-longterm-list-entry-wind-value"),
+        ),
+        native_wind_gust_speed: first_number(
+            entry,
+            selector!(".weather-forecast-longterm-list-entry-wind-hit"),
+        ),
+        wind_bearing: first_text(
+            entry,
+            selector!(".weather-forecast-longterm-list-entry-wind-direction"),
+        )
+        .as_deref()
+        .and_then(compass_to_degrees),
+        humidity: None,
+        cloud_coverage: first_number(
+            entry,
+            selector!(".weather-forecast-longterm-list-entry-cloudy-cloudy-value"),
+        ),
+        // Shown as "1/10".
+        uv_index: first_number(
+            entry,
+            selector!(".weather-forecast-longterm-list-entry-sun-uv-value"),
+        ),
+    })
+}
+
 /// Converts a precipitation amount to mm of water.
 ///
 /// Rain is given in mm, snow as depth in cm. Snow is converted with the
@@ -305,6 +437,19 @@ mod tests {
         );
         let html = std::fs::read_to_string(path).expect("sample page is readable");
         parse(&html, TZ).expect("sample page parses")
+    }
+
+    /// The page saved from
+    /// https://pogoda.interia.pl/prognoza-dlugoterminowa-warszawa-srodmiescie,cId,30704
+    /// on 2026-11-22.
+    fn long_term_sample() -> Vec<DailyForecast> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/warszawa-srodmiescie.45.html"
+        );
+        let html = std::fs::read_to_string(path).expect("sample page is readable");
+        let today = NaiveDate::from_ymd_opt(2026, 11, 22).unwrap();
+        parse_long_term(&html, TZ, today).expect("sample page parses")
     }
 
     fn iso(dt: DateTime<Tz>) -> String {
@@ -448,8 +593,92 @@ mod tests {
 
     #[test]
     fn rejects_pages_without_a_forecast() {
-        let error = parse("<html><body><h1>404</h1></body></html>", TZ).unwrap_err();
+        let html = "<html><body><h1>404</h1></body></html>";
+        let error = parse(html, TZ).unwrap_err();
         assert!(error.to_string().contains("no hourly forecast"), "{error}");
+
+        let today = NaiveDate::from_ymd_opt(2026, 11, 22).unwrap();
+        let error = parse_long_term(html, TZ, today).unwrap_err();
+        assert!(error.to_string().contains("no daily forecast"), "{error}");
+    }
+
+    #[test]
+    fn parses_every_day_of_the_long_term_page() {
+        let daily = long_term_sample();
+        assert_eq!(daily.len(), 45);
+        assert_eq!(iso(daily[0].datetime), "2026-11-22T00:00:00+01:00");
+        // The dates carry no year; the list runs over New Year.
+        assert_eq!(iso(daily[40].datetime), "2027-01-01T00:00:00+01:00");
+        assert_eq!(iso(daily[44].datetime), "2027-01-05T00:00:00+01:00");
+        for pair in daily.windows(2) {
+            assert_eq!(
+                pair[1].datetime.date_naive() - pair[0].datetime.date_naive(),
+                chrono::Duration::days(1),
+                "gap after {}",
+                pair[0].datetime
+            );
+        }
+        for day in &daily {
+            assert!(day.condition.is_some(), "no condition on {}", day.datetime);
+            assert!(day.native_temperature >= day.native_templow);
+            assert!(day.native_precipitation.is_some());
+            assert!(day.native_wind_speed.is_some());
+            assert!(day.native_wind_gust_speed.is_some());
+            assert!(day.wind_bearing.is_some());
+            assert!(day.cloud_coverage.is_some());
+            assert!(day.uv_index.is_some());
+            assert_eq!(day.humidity, None);
+        }
+    }
+
+    #[test]
+    fn parses_long_term_details() {
+        let daily = long_term_sample();
+
+        // 22.11, "Częściowo słonecznie z przelotnymi opadami".
+        let first = &daily[0];
+        assert_eq!(first.condition, Some(Condition::Rainy));
+        assert_eq!(first.native_temperature, 3.0);
+        assert_eq!(first.native_templow, 0.0);
+        assert_eq!(first.native_precipitation, Some(0.3));
+        assert_eq!(first.native_wind_speed, Some(18.0));
+        assert_eq!(first.native_wind_gust_speed, Some(52.0));
+        assert_eq!(first.wind_bearing, Some(270.0));
+        assert_eq!(first.cloud_coverage, Some(98.0));
+        assert_eq!(first.uv_index, Some(1.0));
+
+        // 26.11: a negative low and an easterly wind.
+        let cold = &daily[4];
+        assert_eq!(cold.condition, Some(Condition::Cloudy));
+        assert_eq!(cold.native_temperature, 0.0);
+        assert_eq!(cold.native_templow, -4.0);
+        assert_eq!(cold.wind_bearing, Some(67.5));
+
+        // 30.11: no rain, 6.32 cm of snow.
+        assert_eq!(daily[8].native_precipitation, Some(6.3));
+        // 01.12, "Lekkie opady śniegu": no rain, 1.24 cm of snow.
+        assert_eq!(daily[9].condition, Some(Condition::Snowy));
+        assert_eq!(daily[9].native_precipitation, Some(1.2));
+    }
+
+    #[test]
+    fn resolves_dates_without_a_year() {
+        let date = |y, m, d| NaiveDate::from_ymd_opt(y, m, d).unwrap();
+
+        // The first entry is the date closest to today...
+        let first = |text, today| resolve_date(text, None, today);
+        assert_eq!(first("22.11", date(2026, 11, 22)), Some(date(2026, 11, 22)));
+        assert_eq!(first("01.01", date(2026, 12, 31)), Some(date(2027, 1, 1)));
+        assert_eq!(first("31.12", date(2027, 1, 1)), Some(date(2026, 12, 31)));
+
+        // ...and later entries follow the previous one.
+        let next = |text, previous| resolve_date(text, Some(previous), date(2026, 11, 22));
+        assert_eq!(next("23.11", date(2026, 11, 22)), Some(date(2026, 11, 23)));
+        assert_eq!(next("01.01", date(2026, 12, 31)), Some(date(2027, 1, 1)));
+        assert_eq!(next("29.02", date(2028, 2, 28)), Some(date(2028, 2, 29)));
+
+        assert_eq!(first("Niedziela", date(2026, 11, 22)), None);
+        assert_eq!(first("31.02", date(2026, 11, 22)), None);
     }
 
     #[test]

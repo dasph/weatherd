@@ -6,19 +6,27 @@ mod parser;
 
 use std::process::ExitCode;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{NaiveDate, Utc};
 use ureq::Agent;
 
 use crate::config::{Config, USAGE};
-use crate::model::Report;
+use crate::model::{DailyForecast, HourlyForecast, Report};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Delay before the first retry after a failed refresh; doubles on every
 /// further failure, up to the refresh interval.
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// The daily forecast from the long-term page. It is fetched less often than
+/// the hourly page, but every push has to carry a daily forecast, so the last
+/// one is kept.
+struct DailyCache {
+    fetched: Instant,
+    days: Vec<DailyForecast>,
+}
 
 #[derive(Default)]
 struct Args {
@@ -67,8 +75,9 @@ fn run(config: &Config, args: &Args) -> Result<()> {
         .build()
         .into();
 
+    let mut daily_cache = None;
     if args.once {
-        return refresh(&agent, config, args.dry_run);
+        return refresh(&agent, config, args.dry_run, &mut daily_cache);
     }
 
     // A container's PID 1 ignores SIGTERM unless it installs a handler, so
@@ -85,10 +94,19 @@ fn run(config: &Config, args: &Args) -> Result<()> {
         humantime::format_duration(config.refresh_interval),
         config.timezone
     );
+    match &config.daily_page_url {
+        Some(url) => eprintln!(
+            "watching {url} every {}",
+            humantime::format_duration(config.daily_refresh_interval)
+        ),
+        None => eprintln!(
+            "no long-term page for this LOCATION; deriving the daily forecast from the hourly one"
+        ),
+    }
 
     let mut retry_delay = INITIAL_RETRY_DELAY;
     loop {
-        let wait = match refresh(&agent, config, args.dry_run) {
+        let wait = match refresh(&agent, config, args.dry_run, &mut daily_cache) {
             Ok(()) => {
                 retry_delay = INITIAL_RETRY_DELAY;
                 config.refresh_interval
@@ -113,26 +131,32 @@ fn run(config: &Config, args: &Args) -> Result<()> {
     }
 }
 
-/// Fetches the page, parses it and delivers the result.
-fn refresh(agent: &Agent, config: &Config, dry_run: bool) -> Result<()> {
-    let html = agent
-        .get(&config.page_url)
-        .call()
-        .with_context(|| format!("fetching {}", config.page_url))?
-        .body_mut()
-        .read_to_string()
-        .context("reading the forecast page")?;
+/// Fetches and parses the forecast, then delivers the result.
+fn refresh(
+    agent: &Agent,
+    config: &Config,
+    dry_run: bool,
+    daily_cache: &mut Option<DailyCache>,
+) -> Result<()> {
+    let html = fetch(agent, &config.page_url)?;
     let updated = Utc::now().with_timezone(&config.timezone);
-
     let page = parser::parse(&html, config.timezone)
         .with_context(|| format!("parsing {}", config.page_url))?;
+
+    let daily = daily_forecast(
+        agent,
+        config,
+        daily_cache,
+        updated.date_naive(),
+        &page.hourly,
+    );
     let report = Report {
         location: page.location,
         source: config.page_url.clone(),
         updated,
         current: page.current,
-        daily: daily::summarize(&page.hourly),
         hourly: page.hourly,
+        daily,
     };
 
     let summary = format!(
@@ -157,4 +181,62 @@ fn refresh(agent: &Agent, config: &Config, dry_run: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The daily forecast to send: the long-term page's, refetched once it is
+/// older than the daily refresh interval.
+///
+/// A failure here never fails the refresh. The previous long-term forecast
+/// is kept while it still covers today; otherwise the daily forecast is
+/// derived from the hourly one.
+fn daily_forecast(
+    agent: &Agent,
+    config: &Config,
+    cache: &mut Option<DailyCache>,
+    today: NaiveDate,
+    hourly: &[HourlyForecast],
+) -> Vec<DailyForecast> {
+    if let Some(url) = &config.daily_page_url {
+        let due = cache
+            .as_ref()
+            .is_none_or(|cache| cache.fetched.elapsed() >= config.daily_refresh_interval);
+        if due {
+            let fetched = fetch(agent, url).and_then(|html| {
+                parser::parse_long_term(&html, config.timezone, today)
+                    .with_context(|| format!("parsing {url}"))
+            });
+            match fetched {
+                Ok(days) => {
+                    eprintln!("fetched {} days of daily forecast", days.len());
+                    *cache = Some(DailyCache {
+                        fetched: Instant::now(),
+                        days,
+                    });
+                }
+                Err(error) => eprintln!("warning: daily forecast not updated: {error:#}"),
+            }
+        }
+    }
+
+    let days = cache
+        .as_ref()
+        .map(|cache| daily::upcoming(&cache.days, today, config.daily_days))
+        .unwrap_or_default();
+    if days.is_empty() {
+        let mut days = daily::summarize(hourly);
+        days.truncate(config.daily_days);
+        days
+    } else {
+        days
+    }
+}
+
+fn fetch(agent: &Agent, url: &str) -> Result<String> {
+    agent
+        .get(url)
+        .call()
+        .with_context(|| format!("fetching {url}"))?
+        .body_mut()
+        .read_to_string()
+        .with_context(|| format!("reading {url}"))
 }

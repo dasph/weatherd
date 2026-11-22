@@ -9,6 +9,7 @@ services:
       LOCATION: "warszawa,cId,36917"
       WEBHOOK_URL: "http://homeassistant/api/webhook/CHANGE-ME"
       REFRESH_INTERVAL: "1h"
+      DAILY_REFRESH_INTERVAL: "6h"
       TZ: "Europe/Warsaw"
 
 networks:

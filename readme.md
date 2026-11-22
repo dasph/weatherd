@@ -1,9 +1,9 @@
 # weatherd
 
-Scrapes the hour-by-hour forecast from [pogoda.interia.pl](https://pogoda.interia.pl)
-and pushes it as JSON to a Home Assistant webhook, where a template weather
-entity turns it into a regular `weather.*` entity with hourly and daily
-forecasts.
+Scrapes the hour-by-hour and the 45-day forecast from
+[pogoda.interia.pl](https://pogoda.interia.pl) and pushes them as JSON to a
+Home Assistant webhook, where a template weather entity turns them into a
+regular `weather.*` entity with hourly and daily forecasts.
 
 ## Things to know
 
@@ -12,9 +12,23 @@ forecasts.
   that you add to `configuration.yaml` (see [Home Assistant](#home-assistant)).
   The YAML there uses the current option names; older Home Assistant releases
   want a `_template` suffix.
-- **The daily forecast is computed, not scraped.** The page only lists hours,
-  so each day's high/low, precipitation and condition are aggregated from
-  them. The first day covers only the hours that are left of it.
+- **Hourly and daily forecasts come from two pages.** The hourly forecast and
+  the current conditions come from the hour-by-hour page (`prognoza-szczegolowa-…`,
+  about five days), the daily forecast from the 45-day page
+  (`prognoza-dlugoterminowa-…`). Both are derived from `LOCATION` and sent in
+  the same push; Home Assistant shows one or the other depending on the
+  forecast type you select.
+- **The two pages are fetched on separate schedules.** The hour-by-hour page
+  is fetched every `REFRESH_INTERVAL`, the 45-day page every
+  `DAILY_REFRESH_INTERVAL`. Every push still carries the daily forecast (the
+  last one fetched), because Home Assistant replaces both forecasts on each
+  push.
+- **Far-out days are rough guesses.** Only the first `DAILY_DAYS` days
+  (default 14) of the 45 are pushed.
+- **The daily forecast has a fallback.** If the 45-day page cannot be fetched
+  or parsed, the previous daily forecast is kept; if there is none, it is
+  computed from the hourly forecast (about five days, the first covering only
+  the hours that are left of today) until the page works again.
 - **Current humidity is a forecast value.** The page shows no observed
   humidity and Home Assistant requires one, so it is taken from the first
   forecast hour.
@@ -26,10 +40,12 @@ forecasts.
   at the Docker host's address instead.
 - **`TZ` matters.** The page shows local times without a zone; they are
   interpreted in `TZ` (default `Europe/Warsaw`).
-- **The parser tests need the sample page.**
-  `tests/fixtures/warszawa-srodmiescie.html` is a saved copy of a forecast
-  page that the parser tests read. When the site changes its markup, save a
-  fresh copy there and update the parser and the expected values in the tests.
+- **The parser tests need the sample pages.**
+  `tests/fixtures/warszawa-srodmiescie.html` (hour-by-hour) and
+  `tests/fixtures/warszawa-srodmiescie.45.html` (45-day) are saved copies of
+  the forecast pages that the parser tests read. When the site changes its
+  markup, save fresh copies there and update the parser and the expected
+  values in the tests.
 
 ## Configuration
 
@@ -37,7 +53,9 @@ forecasts.
 | ------------------ | -------- | --------------- | ----------- |
 | `LOCATION`         | yes      |                 | Location part of the forecast URL. For `https://pogoda.interia.pl/prognoza-szczegolowa-warszawa,cId,36917` it is `warszawa,cId,36917`. The full URL is accepted too. |
 | `WEBHOOK_URL`      | yes      |                 | Home Assistant webhook, e.g. `http://homeassistant/api/webhook/<webhook_id>`. |
-| `REFRESH_INTERVAL` | no       | `1h`            | How often to fetch and push, e.g. `30m`, `1h`, `1h 30m`. Minimum `1m`; the site updates every 30 minutes. |
+| `REFRESH_INTERVAL` | no       | `1h`            | How often to fetch the current conditions and hourly forecast and push, e.g. `30m`, `1h`, `1h 30m`. Minimum `1m`; the site updates every 30 minutes. |
+| `DAILY_REFRESH_INTERVAL` | no | `6h`            | How often to fetch the daily (45-day) forecast. It is checked on every refresh, so it is effectively rounded up to a multiple of `REFRESH_INTERVAL`. Minimum `1m`. |
+| `DAILY_DAYS`       | no       | `14`            | Number of days of daily forecast to push, `1`-`45`. |
 | `TZ`               | no       | `Europe/Warsaw` | Time zone of the times shown on the page. |
 
 Flags, mainly for testing:
@@ -51,7 +69,9 @@ LOCATION='warszawa,cId,36917' cargo run -- --once --dry-run
 ```
 
 A failed fetch or push is logged and retried after 30 s, doubling up to the
-refresh interval. Nothing is pushed when the page cannot be parsed.
+refresh interval. Nothing is pushed when the hour-by-hour page cannot be
+parsed. A failure of the 45-day page only logs a warning (see
+[Things to know](#things-to-know)) and is retried on the next refresh.
 
 ## Home Assistant
 
@@ -146,14 +166,15 @@ Metric units throughout: °C, km/h, hPa, mm, %.
     {
       "datetime": "2026-11-22T00:00:00+01:00",
       "condition": "rainy",
-      "native_temperature": 4.0,
-      "native_templow": 2.0,
-      "native_precipitation": 3.4,
-      "native_wind_speed": 20.0,
-      "native_wind_gust_speed": 44.0,
+      "native_temperature": 3.0,
+      "native_templow": 0.0,
+      "native_precipitation": 0.3,
+      "native_wind_speed": 18.0,
+      "native_wind_gust_speed": 52.0,
       "wind_bearing": 270.0,
-      "humidity": 88.0,
-      "cloud_coverage": 89.0
+      "humidity": null,
+      "cloud_coverage": 98.0,
+      "uv_index": 1.0
     }
   ]
 }
@@ -165,11 +186,13 @@ Notes:
 - `hourly` has one entry per hour for about five days, starting with the next
   full hour. Its entries, like the `daily` ones, only use keys Home Assistant
   accepts in a forecast, so the lists can be passed through unchanged.
-- `daily` is computed from `hourly`: high/low, total precipitation, strongest
-  wind and gust, mean humidity and cloud cover. The condition is the most
-  frequent one between 07:00 and 18:00, with precipitation taking over once it
-  covers a quarter of those hours. The first day only covers the hours that
-  are left of it.
+- `daily` has one entry per day from today on, taken from the 45-day page.
+  That page has no humidity, so `humidity` is `null` there.
+- When `daily` has to be computed from `hourly` instead, it holds high/low,
+  total precipitation, strongest wind and gust, mean humidity and cloud cover,
+  and no `uv_index`. The condition is the most frequent one between 07:00 and
+  18:00, with precipitation taking over once it covers a quarter of those
+  hours.
 - `condition` is a Home Assistant weather condition, mapped from the page's
   (AccuWeather) icon; `current.description` keeps the page's Polish wording.
 - `native_precipitation` is rain plus the liquid equivalent of snow, and

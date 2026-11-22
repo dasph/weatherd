@@ -2,7 +2,7 @@
 name = "weatherd"
 version = "0.1.0"
 edition = "2024"
-description = "Scrapes the pogoda.interia.pl hourly forecast and pushes it to a Home Assistant webhook"
+description = "Scrapes the pogoda.interia.pl hourly and daily forecasts and pushes them to a Home Assistant webhook"
 publish = false
 
 [dependencies]

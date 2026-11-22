@@ -1,11 +1,13 @@
-//! Daily forecast derived from the hourly one.
+//! Selection of the daily forecast to send.
 //!
-//! The page only lists hours, starting with the next full hour, so the first
-//! day usually covers just the remainder of today.
+//! The daily forecast normally comes from the long-term page. When that page
+//! is unavailable it is derived from the hourly forecast instead; the hourly
+//! page starts with the next full hour, so the first derived day usually
+//! covers just the remainder of today.
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, NaiveTime, TimeZone, Timelike};
+use chrono::{DateTime, NaiveDate, NaiveTime, TimeZone, Timelike};
 use chrono_tz::Tz;
 
 use crate::condition::Condition;
@@ -16,7 +18,20 @@ use crate::parser::round1;
 /// does not outvote a rainy day.
 const DAYTIME_HOURS: std::ops::RangeInclusive<u32> = 7..=18;
 
-/// Groups consecutive hourly entries by local date.
+/// The days from `today` on, at most `limit` of them.
+///
+/// The long-term forecast is fetched less often than it is sent, so it can
+/// still start with a day that has passed.
+pub fn upcoming(days: &[DailyForecast], today: NaiveDate, limit: usize) -> Vec<DailyForecast> {
+    days.iter()
+        .filter(|day| day.datetime.date_naive() >= today)
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
+/// Derives a daily forecast by grouping consecutive hourly entries by local
+/// date.
 pub fn summarize(hourly: &[HourlyForecast]) -> Vec<DailyForecast> {
     hourly
         .chunk_by(|a, b| a.datetime.date_naive() == b.datetime.date_naive())
@@ -50,6 +65,7 @@ fn summarize_day(hours: &[HourlyForecast]) -> DailyForecast {
         wind_bearing: windiest.and_then(|h| h.wind_bearing),
         humidity: mean(hours.iter().filter_map(|h| h.humidity)),
         cloud_coverage: mean(hours.iter().filter_map(|h| h.cloud_coverage)),
+        uv_index: None,
     }
 }
 
@@ -195,5 +211,27 @@ mod tests {
             hour(22, 10, 0.0, Condition::Cloudy),
         ];
         assert_eq!(summarize(&hourly)[0].condition, Some(Condition::Cloudy));
+    }
+
+    #[test]
+    fn selects_upcoming_days() {
+        let days = summarize(&[
+            hour(22, 12, 1.0, Condition::Cloudy),
+            hour(23, 12, 2.0, Condition::Cloudy),
+            hour(24, 12, 3.0, Condition::Cloudy),
+            hour(25, 12, 4.0, Condition::Cloudy),
+        ]);
+        let highs = |today: u32, limit| -> Vec<f64> {
+            let today = NaiveDate::from_ymd_opt(2026, 11, today).unwrap();
+            upcoming(&days, today, limit)
+                .iter()
+                .map(|day| day.native_temperature)
+                .collect()
+        };
+        assert_eq!(highs(22, 10), [1.0, 2.0, 3.0, 4.0]);
+        // A forecast fetched yesterday no longer starts with today.
+        assert_eq!(highs(23, 10), [2.0, 3.0, 4.0]);
+        assert_eq!(highs(23, 2), [2.0, 3.0]);
+        assert_eq!(highs(26, 10), [] as [f64; 0]);
     }
 }
