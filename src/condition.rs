@@ -33,20 +33,29 @@ pub enum Condition {
     LightningRainy,
     #[serde(rename = "hail")]
     Hail,
-    #[serde(rename = "exceptional")]
-    Exceptional,
 }
 
 impl Condition {
     /// Resolves a condition from the icon code, falling back to the Polish
-    /// description when the code is missing or unknown.
-    pub fn resolve(icon: Option<u32>, phrase: Option<&str>) -> Option<Self> {
+    /// description when the code is missing or unknown, and to the cloud
+    /// cover (%) when neither says anything about the sky.
+    pub fn resolve(
+        icon: Option<u32>,
+        phrase: Option<&str>,
+        cloud_coverage: Option<f64>,
+    ) -> Option<Self> {
         icon.and_then(Self::from_icon)
             .or_else(|| phrase.and_then(Self::from_phrase))
+            .or_else(|| cloud_coverage.map(Self::from_cloud_coverage))
     }
 
     /// Interia's forecast is powered by AccuWeather and reuses its icon
     /// numbering (`ico-N`): 1-32 are day/any-time icons, 33-44 night ones.
+    ///
+    /// Icons 24 ("Lód", ice), 30 (hot) and 31 (cold) describe the temperature
+    /// rather than the sky and are deliberately unmapped. Home Assistant's
+    /// closest condition, `exceptional`, is drawn as an alert sign, which
+    /// reads as a broken forecast.
     pub fn from_icon(code: u32) -> Option<Self> {
         Some(match code {
             1 | 2 | 5 => Self::Sunny,
@@ -56,7 +65,6 @@ impl Condition {
             12..=14 | 18 | 26 => Self::Rainy,
             15..=17 => Self::LightningRainy,
             19..=23 => Self::Snowy,
-            24 | 30 | 31 => Self::Exceptional,
             25 => Self::Hail,
             29 => Self::SnowyRainy,
             32 => Self::Windy,
@@ -103,6 +111,17 @@ impl Condition {
         })
     }
 
+    /// A sky condition for the given cloud cover (%).
+    pub fn from_cloud_coverage(percent: f64) -> Self {
+        if percent < 25.0 {
+            Self::Sunny
+        } else if percent < 75.0 {
+            Self::PartlyCloudy
+        } else {
+            Self::Cloudy
+        }
+    }
+
     pub fn is_precipitation(self) -> bool {
         matches!(
             self,
@@ -144,8 +163,33 @@ mod tests {
     }
 
     #[test]
+    fn maps_temperature_icons_from_cloud_cover() {
+        // "Lód" on a fully overcast day.
+        let resolve = |cloud| Condition::resolve(Some(24), Some("Lód"), cloud);
+        assert_eq!(resolve(Some(100.0)), Some(Condition::Cloudy));
+        assert_eq!(resolve(Some(50.0)), Some(Condition::PartlyCloudy));
+        assert_eq!(resolve(Some(10.0)), Some(Condition::Sunny));
+        assert_eq!(resolve(None), None);
+        for icon in [30, 31] {
+            assert_eq!(
+                Condition::resolve(Some(icon), None, Some(90.0)),
+                Some(Condition::Cloudy)
+            );
+        }
+        // Icons and descriptions that do describe the sky win over it.
+        assert_eq!(
+            Condition::resolve(Some(1), None, Some(100.0)),
+            Some(Condition::Sunny)
+        );
+        assert_eq!(
+            Condition::resolve(Some(99), Some("Śnieg"), Some(10.0)),
+            Some(Condition::Snowy)
+        );
+    }
+
+    #[test]
     fn falls_back_to_the_description() {
-        let resolve = |phrase| Condition::resolve(Some(99), Some(phrase));
+        let resolve = |phrase| Condition::resolve(Some(99), Some(phrase), None);
         assert_eq!(resolve("Lekkie opady śniegu"), Some(Condition::Snowy));
         assert_eq!(resolve("Deszcz ze śniegiem"), Some(Condition::SnowyRainy));
         assert_eq!(resolve("Przelotne opady"), Some(Condition::Rainy));
@@ -158,7 +202,7 @@ mod tests {
         assert_eq!(resolve("???"), None);
         // A known icon wins over the text.
         assert_eq!(
-            Condition::resolve(Some(7), Some("Burze")),
+            Condition::resolve(Some(7), Some("Burze"), None),
             Some(Condition::Cloudy)
         );
     }

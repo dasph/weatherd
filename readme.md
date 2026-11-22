@@ -195,6 +195,9 @@ Notes:
   hours.
 - `condition` is a Home Assistant weather condition, mapped from the page's
   (AccuWeather) icon; `current.description` keeps the page's Polish wording.
+  The icons for ice ("Lód"), heat and cold say nothing about the sky, so for
+  those the condition follows the cloud cover (sunny, partly cloudy or
+  cloudy).
 - `native_precipitation` is rain plus the liquid equivalent of snow, and
   `current.humidity` comes from the first forecast hour (see
   [Things to know](#things-to-know)).

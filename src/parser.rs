@@ -88,7 +88,8 @@ fn parse_current(root: ElementRef) -> Result<Current> {
         .filter(|alt| !alt.is_empty());
 
     Ok(Current {
-        condition: Condition::resolve(icon.and_then(icon_code), description.as_deref()),
+        // This block shows no cloud cover to fall back on.
+        condition: Condition::resolve(icon.and_then(icon_code), description.as_deref(), None),
         description,
         temperature: first_number(section, selector!(".weather-currently-temp-strict"))
             .context("current temperature not found on the page")?,
@@ -210,7 +211,8 @@ fn parse_entry(
     }
     let precipitation = precipitation.map(round1);
 
-    let mut condition = Condition::resolve(icon.and_then(icon_code), phrase.as_deref());
+    let mut condition =
+        Condition::resolve(icon.and_then(icon_code), phrase.as_deref(), cloud_coverage);
     if condition == Some(Condition::Rainy)
         && precipitation.is_some_and(|mm| mm >= POURING_MM_PER_HOUR)
     {
@@ -325,9 +327,14 @@ fn parse_day(entry: ElementRef, date: NaiveDate, tz: Tz) -> Option<DailyForecast
         *precipitation.get_or_insert(0.0) += liquid_mm(amount, &unit, is_snow);
     }
 
+    let cloud_coverage = first_number(
+        entry,
+        selector!(".weather-forecast-longterm-list-entry-cloudy-cloudy-value"),
+    );
+
     Some(DailyForecast {
         datetime,
-        condition: Condition::resolve(icon.and_then(icon_code), phrase.as_deref()),
+        condition: Condition::resolve(icon.and_then(icon_code), phrase.as_deref(), cloud_coverage),
         native_temperature: first_number(
             entry,
             selector!(".weather-forecast-longterm-list-entry-forecast-temp"),
@@ -352,10 +359,7 @@ fn parse_day(entry: ElementRef, date: NaiveDate, tz: Tz) -> Option<DailyForecast
         .as_deref()
         .and_then(compass_to_degrees),
         humidity: None,
-        cloud_coverage: first_number(
-            entry,
-            selector!(".weather-forecast-longterm-list-entry-cloudy-cloudy-value"),
-        ),
+        cloud_coverage,
         // Shown as "1/10".
         uv_index: first_number(
             entry,
